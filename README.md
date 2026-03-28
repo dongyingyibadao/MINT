@@ -100,7 +100,7 @@ lerobot-train \
     --output_dir=./outputs/mint_training \
     --job_name=mint_training \
     --policy.repo_id=<your_repo_id> \
-    --policy.pretrained_path=huangrm/MINT-libero \
+    --policy.pretrained_path=huangrm/pi05_base \ # training from pi05 base model
     --policy.vqvae_name_or_path=<path/to/tokenizer> \
     --policy.compile_model=false \
     --policy.gradient_checkpointing=true \
