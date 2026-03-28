@@ -132,7 +132,7 @@ If you find this project useful, please cite:
 ```bibtex
 @article{huang2026mimic,
   title={Mimic Intent, Not Just Trajectories},
-  author={Huang, Renming and Zeng, Chendong and Tang, Wenjing and Cai, Jingtian and Lu, Cewu and Cai, Panpan},
+  author={Huang, Renming and Zeng, Chendong and Tang, Wenjing and Cai, Jintian and Lu, Cewu and Cai, Panpan},
   journal={arXiv preprint arXiv:2602.08602},
   year={2026}
 }
