@@ -560,6 +560,13 @@ class MINTPytorch(nn.Module):
             quant_resi=config.quant_resi,
             share_quant_resi=config.share_quant_resi,
             patchwise=config.patchwise,
+            tokenizer_align_enable=config.tokenizer_align_enable,
+            tokenizer_align_model_name=config.tokenizer_align_model_name,
+            tokenizer_align_proj_dim=config.tokenizer_align_proj_dim,
+            tokenizer_align_temperature=config.tokenizer_align_temperature,
+            tokenizer_align_weight=config.tokenizer_align_weight,
+            tokenizer_align_warmup_steps=config.tokenizer_align_warmup_steps,
+            tokenizer_align_max_length=config.tokenizer_align_max_length,
         )
 
         self.sos_token = nn.Parameter(torch.zeros(1, 1, action_expert_config.width))

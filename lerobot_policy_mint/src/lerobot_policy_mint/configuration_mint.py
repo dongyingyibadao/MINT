@@ -42,6 +42,14 @@ class MINTConfig(PreTrainedConfig):
         "grouped_depth": 2,    
         "norm": "layer",
     })
+    # Stage-B tokenizer alignment settings. Default-off keeps original behavior.
+    tokenizer_align_enable: bool = False
+    tokenizer_align_model_name: str = "BAAI/bge-large-en-v1.5"
+    tokenizer_align_proj_dim: int = 256
+    tokenizer_align_temperature: float = 0.07
+    tokenizer_align_weight: float = 0.1
+    tokenizer_align_warmup_steps: int = 1_000
+    tokenizer_align_max_length: int = 64
     vqvae_name_or_path: str | None = ""
 
     image_resolution: tuple[int, int] = (
@@ -98,6 +106,15 @@ class MINTConfig(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.tokenizer_align_proj_dim <= 0:
+            raise ValueError("tokenizer_align_proj_dim must be > 0")
+        if self.tokenizer_align_temperature <= 0:
+            raise ValueError("tokenizer_align_temperature must be > 0")
+        if self.tokenizer_align_weight < 0:
+            raise ValueError("tokenizer_align_weight must be >= 0")
+        if self.tokenizer_align_warmup_steps < 0:
+            raise ValueError("tokenizer_align_warmup_steps must be >= 0")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

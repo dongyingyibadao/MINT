@@ -24,3 +24,16 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training artifacts
+checkpoints/
+outputs/
+**/checkpoints/
+**/outputs/
+
+# Logs and runtime files
+*.log
+core.*

@@ -648,6 +648,13 @@ class MultiScaleVQVAE(nn.Module):
         upsample_mode='linear',
         downsample_mode='area',
         patchwise: dict | None = None,
+        tokenizer_align_enable: bool = False,
+        tokenizer_align_model_name: str = "BAAI/bge-large-en-v1.5",
+        tokenizer_align_proj_dim: int = 256,
+        tokenizer_align_temperature: float = 0.07,
+        tokenizer_align_weight: float = 0.1,
+        tokenizer_align_warmup_steps: int = 1000,
+        tokenizer_align_max_length: int = 64,
 
     ):
         super().__init__()
@@ -701,14 +708,141 @@ class MultiScaleVQVAE(nn.Module):
         self.quant_conv = nn.Conv1d(self.Cvae, self.Cvae, quant_conv_ks, padding=quant_conv_ks // 2)
         self.post_quant_conv = nn.Conv1d(self.Cvae, self.Cvae, quant_conv_ks, padding=quant_conv_ks // 2)
 
+        self.tokenizer_align_enable = tokenizer_align_enable
+        self.tokenizer_align_model_name = tokenizer_align_model_name
+        self.tokenizer_align_proj_dim = tokenizer_align_proj_dim
+        self.tokenizer_align_temperature = tokenizer_align_temperature
+        self.tokenizer_align_weight = tokenizer_align_weight
+        self.tokenizer_align_warmup_steps = tokenizer_align_warmup_steps
+        self.tokenizer_align_max_length = tokenizer_align_max_length
 
-    def forward(self, inp, ret_usages: bool = False, ret_ms_l1: bool = False):
-        # Patchwise embedding if enabled
+        self.align_action_proj = None
+        self.align_text_proj = None
+        self.text_tokenizer = None
+        self.text_encoder = None
+        if self.tokenizer_align_enable:
+            self._init_text_alignment_modules()
+
+    def _init_text_alignment_modules(self):
+        try:
+            from transformers import AutoModel, AutoTokenizer
+        except Exception as exc:
+            raise RuntimeError(
+                "transformers is required when tokenizer_align_enable=True"
+            ) from exc
+
+        self.text_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_align_model_name)
+        self.text_encoder = AutoModel.from_pretrained(self.tokenizer_align_model_name)
+        self.text_encoder.eval()
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+
+        text_hidden = int(self.text_encoder.config.hidden_size)
+        self.align_action_proj = nn.Linear(self.Cvae, self.tokenizer_align_proj_dim)
+        self.align_text_proj = nn.Linear(text_hidden, self.tokenizer_align_proj_dim)
+
+    @staticmethod
+    def _masked_mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
+        summed = (last_hidden_state * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp(min=1e-6)
+        return summed / denom
+
+    @torch.no_grad()
+    def encode_texts(self, texts: List[str], device: Optional[torch.device] = None) -> torch.Tensor:
+        if not self.tokenizer_align_enable or self.text_encoder is None or self.text_tokenizer is None:
+            raise RuntimeError("Text encoder is not initialized. Set tokenizer_align_enable=True.")
+        if len(texts) == 0:
+            raise ValueError("texts cannot be empty")
+
+        dev = device if device is not None else next(self.parameters()).device
+        tokenized = self.text_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.tokenizer_align_max_length,
+            return_tensors="pt",
+        )
+        tokenized = {k: v.to(dev) for k, v in tokenized.items()}
+
+        self.text_encoder = self.text_encoder.to(dev)
+        out = self.text_encoder(**tokenized)
+        return self._masked_mean_pool(out.last_hidden_state, tokenized["attention_mask"])
+
+    def encode_to_latent(self, inp: torch.Tensor) -> torch.Tensor:
+        x = inp
         if self.patchwise_embed is not None:
-            inp = self.patchwise_embed(inp)  # (B, T, 7) -> (B, 3*D, T)
+            x = self.patchwise_embed(x)
+        return self.quant_conv(self.encoder(x))
 
-        f = self.quant_conv(self.encoder(inp))
+    def decode_from_latent(self, f_hat: torch.Tensor) -> torch.Tensor:
+        rec = self.decoder(self.post_quant_conv(f_hat))
+        if self.patchwise_proj is not None:
+            rec = self.patchwise_proj(rec)
+        return rec
+
+    def _get_align_weight(self, global_step: Optional[int]) -> float:
+        if self.tokenizer_align_warmup_steps <= 0:
+            return float(self.tokenizer_align_weight)
+        if global_step is None:
+            return float(self.tokenizer_align_weight)
+        ratio = min(1.0, float(global_step) / float(self.tokenizer_align_warmup_steps))
+        return float(self.tokenizer_align_weight) * ratio
+
+    def compute_align_loss(
+        self,
+        action_latent: torch.Tensor,
+        text_latent: torch.Tensor,
+        global_step: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if self.align_action_proj is None or self.align_text_proj is None:
+            raise RuntimeError("Align projection heads are not initialized.")
+        if action_latent.shape[0] != text_latent.shape[0]:
+            raise ValueError(
+                f"Batch size mismatch for alignment: action={action_latent.shape[0]}, text={text_latent.shape[0]}"
+            )
+
+        action_feat = F.normalize(self.align_action_proj(action_latent), dim=-1)
+        text_feat = F.normalize(self.align_text_proj(text_latent), dim=-1)
+        logits = (action_feat @ text_feat.transpose(0, 1)) / self.tokenizer_align_temperature
+        labels = torch.arange(logits.shape[0], device=logits.device)
+
+        loss_a2t = F.cross_entropy(logits, labels)
+        loss_t2a = F.cross_entropy(logits.transpose(0, 1), labels)
+        raw_loss = 0.5 * (loss_a2t + loss_t2a)
+        weight = self._get_align_weight(global_step)
+        weighted = raw_loss * weight
+        return {
+            "align_loss": weighted,
+            "align_loss_raw": raw_loss.detach(),
+            "align_weight": torch.tensor(weight, device=logits.device, dtype=raw_loss.dtype),
+        }
+
+
+    def forward(
+        self,
+        inp,
+        ret_usages: bool = False,
+        ret_ms_l1: bool = False,
+        texts: Optional[List[str]] = None,
+        text_embeds: Optional[torch.Tensor] = None,
+        global_step: Optional[int] = None,
+        return_aux: bool = False,
+    ):
+        f = self.encode_to_latent(inp)
         SN = len(self.patch_nums)
+        _ = SN
+
+        aux: Dict[str, torch.Tensor] = {}
+        if self.tokenizer_align_enable:
+            txt = text_embeds
+            if txt is None and texts is not None:
+                txt = self.encode_texts(texts, device=f.device)
+            if txt is not None:
+                if txt.device != f.device:
+                    txt = txt.to(f.device)
+                action_latent = f.mean(dim=-1)
+                aux.update(self.compute_align_loss(action_latent, txt, global_step=global_step))
 
         q_out = self.quantizer(
             f,
@@ -721,21 +855,58 @@ class MultiScaleVQVAE(nn.Module):
         else:
             f_hat, usages, vq_loss = q_out
 
-        rec = self.decoder(self.post_quant_conv(f_hat))
-        
-        # Patchwise projection if enabled
-        if self.patchwise_proj is not None:
-            rec = self.patchwise_proj(rec)  # (B, 3*D, T) -> (B, T, 8)
+        rec = self.decode_from_latent(f_hat)
         
         if ret_ms_l1:
             rec_scales: List[torch.Tensor] = []
             for fh in fhat_scales:
-                rec_s = self.decoder(self.post_quant_conv(fh))
-                if self.patchwise_proj is not None:
-                    rec_s = self.patchwise_proj(rec_s)
+                rec_s = self.decode_from_latent(fh)
                 rec_scales.append(rec_s)
+            if return_aux:
+                return rec, usages, vq_loss, rec_scales, aux
             return rec, usages, vq_loss, rec_scales
+        if return_aux:
+            return rec, usages, vq_loss, aux
         return rec, usages, vq_loss
+
+    def compute_tokenizer_losses(
+        self,
+        inp: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
+        texts: Optional[List[str]] = None,
+        text_embeds: Optional[torch.Tensor] = None,
+        global_step: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        rec, _, vq_loss, aux = self.forward(
+            inp,
+            ret_usages=False,
+            ret_ms_l1=False,
+            texts=texts,
+            text_embeds=text_embeds,
+            global_step=global_step,
+            return_aux=True,
+        )
+
+        tgt = inp if target is None else target
+        if rec.shape[-1] == 8 and tgt.shape[-1] == 7:
+            recon_cont = F.l1_loss(rec[..., :6], tgt[..., :6])
+            grip_target = (tgt[..., 6] > 0).long()
+            grip_logits = rec[..., 6:8].reshape(-1, 2)
+            recon_grip = F.cross_entropy(grip_logits, grip_target.reshape(-1))
+            recon_loss = recon_cont + recon_grip
+        else:
+            recon_loss = F.mse_loss(rec, tgt)
+
+        align_loss = aux.get("align_loss", torch.zeros_like(vq_loss))
+        total_loss = recon_loss + vq_loss + align_loss
+        return {
+            "loss": total_loss,
+            "recon_loss": recon_loss,
+            "vq_loss": vq_loss,
+            "align_loss": align_loss,
+            "align_loss_raw": aux.get("align_loss_raw", torch.zeros_like(vq_loss)),
+            "align_weight": aux.get("align_weight", torch.zeros_like(vq_loss)),
+        }
 
     def inp_to_idxBl(self, inp_seq_no_grad: torch.Tensor, patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:
         # Patchwise embedding if enabled
@@ -787,6 +958,9 @@ class MultiScaleVQVAE(nn.Module):
         sd = None
         if isinstance(state, dict) and "trainer" in state and isinstance(state["trainer"], dict):
             sd = state["trainer"].get("vae_wo_ddp", None)
+        if sd is None and isinstance(state, dict) and "model_state_dict" in state:
+            # Support local tokenizer checkpoints saved by scripts/train_tokenizer_libero.py.
+            sd = state["model_state_dict"]
         if sd is None and isinstance(state, dict) and "state_dict" in state:
             sd = state["state_dict"]
         if sd is None and isinstance(state, dict):
