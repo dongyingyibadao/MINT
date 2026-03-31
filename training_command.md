@@ -74,7 +74,7 @@ mkdir -p outputs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TOKENIZERS_PARALLELISM=false
 
 # 你已验证单卡 conv 正常，这里保留库优先级避免多进程回退系统库
@@ -83,7 +83,7 @@ unset LD_PRELOAD
 
 accelerate launch \
   --multi_gpu \
-  --num_processes=7 \
+  --num_processes=8 \
   --mixed_precision=bf16 \
   $(which lerobot-train) \
   --dataset.repo_id=local/libero \
@@ -99,10 +99,11 @@ accelerate launch \
   --steps=200000 \
   --batch_size=16 \
   --log_freq=500 \
-  --output_dir=./outputs/policy_200k_org_stable_huangrm_pi05 \
-  --job_name=policy_200k_org_stable_huangrm_pi05 \
-  --policy.repo_id=local/policy_200k_org_stable_huangrm_pi05 \
-  2>&1 | tee outputs/policy_200k_org_stable_huangrm_pi05.log
+  --save_freq=2000 \
+  --output_dir=./outputs/policy_100k_org_stable_huangrm_pi05_test \
+  --job_name=policy_100k_org_stable_huangrm_pi05_test \
+  --policy.repo_id=local/policy_100k_org_stable_huangrm_pi05_test \
+  2>&1 | tee outputs/policy_100k_org_stable_huangrm_pi05_test.log
 
 
 

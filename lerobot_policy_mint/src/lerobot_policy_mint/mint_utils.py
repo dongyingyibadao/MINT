@@ -655,6 +655,10 @@ class MultiScaleVQVAE(nn.Module):
         tokenizer_align_weight: float = 0.1,
         tokenizer_align_warmup_steps: int = 1000,
         tokenizer_align_max_length: int = 64,
+        tokenizer_aux_l1_weight: float = 1.0,
+        tokenizer_spectral_weight: float = 1.0,
+        tokenizer_spectral_exclude_last_dim: bool = True,
+        tokenizer_spectral_scale_weights: Optional[Sequence[float]] = None,
 
     ):
         super().__init__()
@@ -715,6 +719,18 @@ class MultiScaleVQVAE(nn.Module):
         self.tokenizer_align_weight = tokenizer_align_weight
         self.tokenizer_align_warmup_steps = tokenizer_align_warmup_steps
         self.tokenizer_align_max_length = tokenizer_align_max_length
+        self.tokenizer_aux_l1_weight = float(tokenizer_aux_l1_weight)
+        self.tokenizer_spectral_weight = float(tokenizer_spectral_weight)
+        self.tokenizer_spectral_exclude_last_dim = bool(tokenizer_spectral_exclude_last_dim)
+        if tokenizer_spectral_scale_weights is None:
+            self.tokenizer_spectral_scale_weights = [1.0 for _ in self.patch_nums]
+        else:
+            self.tokenizer_spectral_scale_weights = [float(w) for w in tokenizer_spectral_scale_weights]
+            if len(self.tokenizer_spectral_scale_weights) != len(self.patch_nums):
+                raise ValueError(
+                    "tokenizer_spectral_scale_weights length must match number of scales: "
+                    f"got {len(self.tokenizer_spectral_scale_weights)} vs {len(self.patch_nums)}"
+                )
 
         self.align_action_proj = None
         self.align_text_proj = None
@@ -788,6 +804,66 @@ class MultiScaleVQVAE(nn.Module):
             return float(self.tokenizer_align_weight)
         ratio = min(1.0, float(global_step) / float(self.tokenizer_align_warmup_steps))
         return float(self.tokenizer_align_weight) * ratio
+
+    @staticmethod
+    def _dct_ii_along_time(x: torch.Tensor) -> torch.Tensor:
+        """Apply DCT-II along the temporal axis (dim=-2) using the paper's unnormalized form."""
+        if x.ndim < 2:
+            raise ValueError(f"Expected tensor with at least 2 dims for DCT, got shape={tuple(x.shape)}")
+        x_work = x.movedim(-2, -1)
+        n = x_work.shape[-1]
+        n_idx = torch.arange(n, device=x_work.device, dtype=x_work.dtype)
+        k_idx = torch.arange(n, device=x_work.device, dtype=x_work.dtype)
+        basis = torch.cos((torch.pi / float(n)) * (n_idx[:, None] + 0.5) * k_idx[None, :])
+        freq = x_work @ basis
+        return freq.movedim(-1, -2)
+
+    def _select_spectral_channels(self, rec: torch.Tensor, tgt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select channels for spectral supervision.
+        Following the paper implementation details, the gripper channel is excluded from DCT/spectral loss.
+        """
+        min_dim = min(rec.shape[-1], tgt.shape[-1])
+        if min_dim <= 0:
+            raise ValueError(f"Invalid channel size for spectral loss: rec={rec.shape}, tgt={tgt.shape}")
+
+        # Special case: model outputs 8 dims where the last two are gripper logits; target uses 7 dims.
+        if rec.shape[-1] == 8 and tgt.shape[-1] == 7:
+            return rec[..., :6], tgt[..., :6]
+
+        if self.tokenizer_spectral_exclude_last_dim and min_dim > 1:
+            return rec[..., : min_dim - 1], tgt[..., : min_dim - 1]
+
+        return rec[..., :min_dim], tgt[..., :min_dim]
+
+    def _compute_scalewise_spectral_loss(self, rec_scales: List[torch.Tensor], tgt: torch.Tensor) -> torch.Tensor:
+        if len(rec_scales) == 0:
+            raise ValueError("rec_scales cannot be empty for spectral loss computation")
+
+        _, tgt_spec = self._select_spectral_channels(rec_scales[-1], tgt)
+        tgt_freq = self._dct_ii_along_time(tgt_spec)
+
+        freq_loss = torch.zeros((), device=tgt.device, dtype=tgt.dtype)
+        for scale_idx, rec_k in enumerate(rec_scales):
+            rec_spec, _ = self._select_spectral_channels(rec_k, tgt)
+            rec_freq = self._dct_ii_along_time(rec_spec)
+            scale_weight = self.tokenizer_spectral_scale_weights[scale_idx]
+            freq_loss = freq_loss + float(scale_weight) * F.mse_loss(rec_freq, tgt_freq)
+
+        return freq_loss * self.tokenizer_spectral_weight
+
+    @staticmethod
+    def _compute_aux_time_recon_loss(rec: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """Auxiliary time-domain reconstruction term (paper's L1 term, with gripper CE compatibility)."""
+        if rec.shape[-1] == 8 and tgt.shape[-1] == 7:
+            recon_cont = F.l1_loss(rec[..., :6], tgt[..., :6])
+            grip_target = (tgt[..., 6] > 0).long()
+            grip_logits = rec[..., 6:8].reshape(-1, 2)
+            recon_grip = F.cross_entropy(grip_logits, grip_target.reshape(-1))
+            return recon_cont + recon_grip
+
+        min_dim = min(rec.shape[-1], tgt.shape[-1])
+        return F.l1_loss(rec[..., :min_dim], tgt[..., :min_dim])
 
     def compute_align_loss(
         self,
@@ -877,10 +953,10 @@ class MultiScaleVQVAE(nn.Module):
         text_embeds: Optional[torch.Tensor] = None,
         global_step: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        rec, _, vq_loss, aux = self.forward(
+        rec, _, vq_loss, rec_scales, aux = self.forward(
             inp,
             ret_usages=False,
-            ret_ms_l1=False,
+            ret_ms_l1=True,
             texts=texts,
             text_embeds=text_embeds,
             global_step=global_step,
@@ -888,20 +964,20 @@ class MultiScaleVQVAE(nn.Module):
         )
 
         tgt = inp if target is None else target
-        if rec.shape[-1] == 8 and tgt.shape[-1] == 7:
-            recon_cont = F.l1_loss(rec[..., :6], tgt[..., :6])
-            grip_target = (tgt[..., 6] > 0).long()
-            grip_logits = rec[..., 6:8].reshape(-1, 2)
-            recon_grip = F.cross_entropy(grip_logits, grip_target.reshape(-1))
-            recon_loss = recon_cont + recon_grip
-        else:
-            recon_loss = F.mse_loss(rec, tgt)
+        freq_loss = self._compute_scalewise_spectral_loss(rec_scales, tgt)
+        aux_l1_loss = self._compute_aux_time_recon_loss(rec, tgt)
+        weighted_aux_l1 = aux_l1_loss * self.tokenizer_aux_l1_weight
 
         align_loss = aux.get("align_loss", torch.zeros_like(vq_loss))
-        total_loss = recon_loss + vq_loss + align_loss
+        total_loss = freq_loss + vq_loss + weighted_aux_l1 + align_loss
         return {
             "loss": total_loss,
-            "recon_loss": recon_loss,
+            "recon_loss": weighted_aux_l1,
+            "freq_loss": freq_loss,
+            "aux_l1_loss": aux_l1_loss,
+            "aux_l1_weight": torch.tensor(
+                self.tokenizer_aux_l1_weight, device=vq_loss.device, dtype=vq_loss.dtype
+            ),
             "vq_loss": vq_loss,
             "align_loss": align_loss,
             "align_loss_raw": aux.get("align_loss_raw", torch.zeros_like(vq_loss)),

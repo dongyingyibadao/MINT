@@ -1,44 +1,78 @@
-# Stage-B: train_tokenizer_libero.py 三种训练状态说明
+# Stage-B: tokenizer 训练快速上手（train_tokenizer_libero.py）
 
-本目录仅针对 tokenizer 训练，不涉及 policy 训练入口。
+本说明仅覆盖 tokenizer 训练，不包含 policy 训练。
 
-## 1) 环境准备
+---
+
+## 1) 先做什么（最短路径）
+
+如果你只想最快开始，请按这三步：
+
+1. 先跑 2k smoke，确认 loss 正常下降。
+2. 再跑长训（org 或 align 版本）。
+3. 用 checkpoints/last/tokenizer.pt 接 policy 训练。
+
+---
+
+## 2) 环境准备
 
 ```bash
 source /inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/miniconda3/bin/activate
 conda activate mint
 cd /inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint
-```
 
-建议设置公共变量：
-
-```bash
 export DATASET_ROOT=/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero
 export CKPT=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/checkpoints/MINT-tokenizer-libero/ms_vqvae.pth
 export ALIGN_MODEL=BAAI/bge-large-en-v1.5
 
-export STEPS=2000
-export BATCH=16
-export WORKERS=4
-export STRIDE=4
-export LR=1e-4
-export WD=1e-2
-export CLIP=1.0
-export LOGF=20
-export SAVEF=200
-
-# 动态学习率参数（warmup + cosine）
-export LR_PEAK_SCALE=0.5
-export LR_WARMUP_STEPS=100
-export LR_WARMUP_INIT_RATIO=0.1
-export LR_MIN_RATIO=0.1
+# 建议减少 tokenizers fork 警告
+export TOKENIZERS_PARALLELISM=false
 ```
 
-## 2) 三种状态如何设置
+---
 
-### A. baseline（无文本对齐）
+## 3) 当前目标函数（已同步代码）
 
-核心开关：不传 `--align`。
+当前 tokenizer 总损失为：
+
+$$
+L_{total} = L_{freq} + L_{vq} + \alpha L_{aux} + L_{align}
+$$
+
+其中：
+
+1. $L_{freq}$：scale-wise DCT 频域重建损失（论文 SDAT 主项）。
+2. $L_{vq}$：量化损失（codebook + commitment）。
+3. $L_{aux}$：时间域辅助重建（默认 L1，含 gripper 兼容分支）。
+4. $L_{align}$：可选双向 InfoNCE（冻结文本编码器）。
+
+日志里你会看到：loss / freq_loss / aux_l1_loss / vq_loss / align_loss / align_loss_raw。
+
+---
+
+## 4) 新增关键参数（和旧版差异）
+
+以下参数是新版 loss 对应新增项：
+
+1. `--spectral_weight`：频域损失总权重。
+2. `--spectral_scale_weights`：各尺度权重，逗号分隔，长度需等于 scales 数。
+3. `--aux_l1_weight`：时间域辅助项权重。
+4. `--include_gripper_in_spectral`：是否把最后一维（常为 gripper）纳入频域监督。
+
+推荐起步：
+
+1. `--spectral_weight=1.0`
+2. `--spectral_scale_weights=1,1,1`
+3. `--aux_l1_weight=1.0`
+4. 不加 `--include_gripper_in_spectral`（默认排除最后一维）
+
+---
+
+## 5) 四种训练模式
+
+### A. baseline（有预训练初始化，无文本对齐）
+
+适用：先看稳定收敛，不引入文本对齐变量。
 
 ```bash
 PYTHONPATH=src python scripts/train_tokenizer_libero.py \
@@ -55,15 +89,18 @@ PYTHONPATH=src python scripts/train_tokenizer_libero.py \
 	--lr_min_ratio=0.1 \
 	--weight_decay=1e-2 \
 	--grad_clip=1.0 \
+	--spectral_weight=1.0 \
+	--spectral_scale_weights=1,1,1 \
+	--aux_l1_weight=1.0 \
 	--log_freq=20 \
 	--save_freq=200 \
 	--tokenizer_ckpt="/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/checkpoints/MINT-tokenizer-libero/ms_vqvae.pth" \
 	--output_dir=outputs/stageb_baseline_2k
 ```
 
-### B. pretrained_align（预训练初始化 + 文本对齐）
+### B. pretrained_align（有预训练初始化，有文本对齐）
 
-核心开关：传 `--align`，并传 `--tokenizer_ckpt`。
+适用：你们当前主推版本（论文损失 + InfoNCE）。
 
 ```bash
 PYTHONPATH=src python scripts/train_tokenizer_libero.py \
@@ -73,7 +110,6 @@ PYTHONPATH=src python scripts/train_tokenizer_libero.py \
 	--num_workers=8 \
 	--stride=4 \
 	--lr=3e-5 \
-    --align_weight=0.05 \
 	--scheduler=cosine \
 	--lr_peak_scale=0.3 \
 	--lr_warmup_steps=50000 \
@@ -81,77 +117,99 @@ PYTHONPATH=src python scripts/train_tokenizer_libero.py \
 	--lr_min_ratio=0.02 \
 	--weight_decay=1e-2 \
 	--grad_clip=0.5 \
+	--spectral_weight=1.0 \
+	--spectral_scale_weights=1,1,1 \
+	--aux_l1_weight=1.0 \
+	--align \
+	--align_model="BAAI/bge-large-en-v1.5" \
+	--align_weight=0.05 \
 	--log_freq=200 \
 	--save_freq=2000 \
 	--tokenizer_ckpt="/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/checkpoints/MINT-tokenizer-libero/ms_vqvae.pth" \
 	--output_dir=outputs/stageb_align_pretrained_2k \
-	--align \
-	--align_model="BAAI/bge-large-en-v1.5"
+	2>&1 | tee outputs/stageb_align_pretrained_2k.log
 ```
 
-### C. raw_align（随机初始化 + 文本对齐）
+### C. raw_align（随机初始化，有文本对齐）
 
-核心开关：传 `--align`，但不传 `--tokenizer_ckpt`（或传空字符串）。
+适用：做对照实验，观察 align 对随机初始化的作用。
 
 ```bash
 PYTHONPATH=src python scripts/train_tokenizer_libero.py \
 	--dataset_root="/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero" \
-	--steps=2000 \
+	--steps=1000000 \
 	--batch_size=16 \
-	--num_workers=4 \
+	--num_workers=8 \
 	--stride=4 \
-	--lr=1e-4 \
+	--lr=3e-5 \
 	--scheduler=cosine \
-	--lr_peak_scale=0.5 \
-	--lr_warmup_steps=100 \
-	--lr_warmup_init_ratio=0.1 \
-	--lr_min_ratio=0.1 \
+	--lr_peak_scale=0.3 \
+	--lr_warmup_steps=50000 \
+	--lr_warmup_init_ratio=0.02 \
+	--lr_min_ratio=0.02 \
 	--weight_decay=1e-2 \
-	--grad_clip=1.0 \
-	--log_freq=20 \
-	--save_freq=200 \
-	--output_dir=outputs/stageb_align_raw_2k \
+	--grad_clip=0.5 \
+	--spectral_weight=1.0 \
+	--spectral_scale_weights=1,1,1 \
+	--aux_l1_weight=1.0 \
 	--align \
-	--align_model="BAAI/bge-large-en-v1.5"
+	--align_model="BAAI/bge-large-en-v1.5" \
+	--align_weight=0.05 \
+	--log_freq=1000 \
+	--save_freq=2000 \
+	--output_dir=outputs/stageb_align_rawtrained_1M_true \
+	2>&1 | tee outputs/stageb_align_rawtrained_1M_true.log
 ```
 
-### D. org（随机初始化）
+### D. org（随机初始化，无文本对齐）
 
-核心开关：不传 `--align`，不传 `--tokenizer_ckpt`（或传空字符串）。
+适用：纯 SDAT 路径对照（不加 InfoNCE）。
 
 ```bash
-source /inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/miniconda3/bin/activate && conda activate mint && cd /inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint && PYTHONPATH=src python scripts/train_tokenizer_libero.py --dataset_root=/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero --steps=1000000 --batch_size=16 --num_workers=8 --stride=4 --lr=3e-5 --scheduler=cosine --lr_peak_scale=0.5 --lr_warmup_steps=20000 --lr_warmup_init_ratio=0.02 --lr_min_ratio=0.01 --weight_decay=1e-2 --grad_clip=0.5 --log_freq=1000 --save_freq=5000 --output_dir=outputs/stageb_org_600k 2>&1 | tee outputs/stageb_org_600k.log
+PYTHONPATH=src python scripts/train_tokenizer_libero.py \
+	--dataset_root="/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero" \
+	--steps=1000000 \
+	--batch_size=16 \
+	--num_workers=8 \
+	--stride=4 \
+	--lr=3e-5 \
+	--scheduler=cosine \
+	--lr_peak_scale=0.3 \
+	--lr_warmup_steps=5000 \
+	--lr_warmup_init_ratio=0.02 \
+	--lr_min_ratio=0.02 \
+	--weight_decay=1e-2 \
+	--grad_clip=0.5 \
+	--spectral_weight=0.2 \
+	--spectral_scale_weights=1,1,1 \
+	--aux_l1_weight=1.0 \
+	--log_freq=1000 \
+	--save_freq=2000 \
+	--output_dir=outputs/stageb_org_1M_true \
+	2>&1 | tee outputs/stageb_org_1M_true.log
 ```
 
-## 3) 代码设置原理
+---
 
-`scripts/train_tokenizer_libero.py` 中，三种状态本质由两个条件决定：
+## 6) 我到底该先跑哪条命令
 
-1. 是否开启 `--align`
-2. 是否提供 `--tokenizer_ckpt`
+建议顺序：
 
-对应关系：
+1. 新环境先跑 A（2k）检查 loss 曲线。
+2. 如果稳定，再跑 B（长训主版本）。
+3. 要做 ablation，再跑 C 和 D。
 
-- baseline: `align=False`，loss 只包含 `recon + vq`
-- pretrained_align: `align=True` 且 `tokenizer_ckpt` 非空，loss 为 `recon + vq + align`
-- raw_align: `align=True` 且 `tokenizer_ckpt` 为空，loss 为 `recon + vq + align`，但初始权重是随机
+---
 
-align 分支使用冻结文本编码器，计算双向 InfoNCE；总损失为：
+## 7) 结果文件如何使用
 
-$$
-L_{total} = L_{recon} + L_{vq} + w(t) \cdot L_{align,raw}
-$$
+训练完成后，使用：
 
-其中 $w(t)$ 是 warmup 权重，前期逐步增大，减少训练初期不稳定。
+1. `outputs/<run_name>/checkpoints/last/tokenizer.pt` 作为 policy 训练的 `--policy.vqvae_name_or_path`。
+2. `outputs/<run_name>/train_report.json` 查看末尾 loss 与超参。
 
-学习率默认采用 warmup + cosine：
+---
 
-1. 先从较小比例升到峰值学习率（`lr * lr_peak_scale`）
-2. 再按 cosine 衰减到 `lr_min_ratio` 对应的下限
+## 8) 备注
 
-## 4) 是否需要保留 experiments 下启动脚本
-
-这个目录下的 `run_tokenizer_align_short.sh` 和 `run_tokenizer_baseline_only.sh` 是纯启动包装脚本，不包含独立算法逻辑。
-为避免误解三种状态由脚本名决定（而不是参数开关决定），建议直接使用上面的 Python 命令。
-
-因此这里默认删除两个脚本，只保留本 README 作为权威入口。
+本目录下旧的 shell 包装脚本不是算法逻辑入口，推荐统一以本 README 的 Python 命令为准。

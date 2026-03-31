@@ -126,6 +126,12 @@ class LiberoActionChunkDataset(Dataset):
 def build_model(args, device):
     from lerobot_policy_mint.mint_utils import MultiScaleVQVAE
 
+    spectral_scale_weights = None
+    if args.spectral_scale_weights.strip():
+        spectral_scale_weights = [
+            float(x.strip()) for x in args.spectral_scale_weights.split(",") if x.strip()
+        ]
+
     model = MultiScaleVQVAE(
         seq_dim=7,
         codebook_size=args.codebook_size,
@@ -141,6 +147,10 @@ def build_model(args, device):
         tokenizer_align_weight=args.align_weight,
         tokenizer_align_warmup_steps=args.align_warmup,
         tokenizer_align_max_length=args.align_max_len,
+        tokenizer_aux_l1_weight=args.aux_l1_weight,
+        tokenizer_spectral_weight=args.spectral_weight,
+        tokenizer_spectral_exclude_last_dim=not args.include_gripper_in_spectral,
+        tokenizer_spectral_scale_weights=spectral_scale_weights,
     )
     if args.tokenizer_ckpt:
         model.load_vqvae_weights(args.tokenizer_ckpt)
@@ -194,6 +204,20 @@ def parse_args():
     p.add_argument("--align_weight", type=float, default=0.1)
     p.add_argument("--align_warmup", type=int, default=1000)
     p.add_argument("--align_max_len", type=int, default=64)
+
+    p.add_argument("--aux_l1_weight", type=float, default=1.0)
+    p.add_argument("--spectral_weight", type=float, default=1.0)
+    p.add_argument(
+        "--spectral_scale_weights",
+        type=str,
+        default="",
+        help="Comma-separated per-scale weights for spectral loss (e.g., '1,1,1').",
+    )
+    p.add_argument(
+        "--include_gripper_in_spectral",
+        action="store_true",
+        help="If set, include the last action dim in DCT spectral loss. By default it is excluded.",
+    )
 
     p.add_argument("--codebook_size", type=int, default=512)
     p.add_argument("--codebook_dim", type=int, default=32)
@@ -287,6 +311,9 @@ def main():
             "step": step,
             "loss": float(losses["loss"].detach().cpu().item()),
             "recon_loss": float(losses["recon_loss"].detach().cpu().item()),
+            "freq_loss": float(losses["freq_loss"].detach().cpu().item()),
+            "aux_l1_loss": float(losses["aux_l1_loss"].detach().cpu().item()),
+            "aux_l1_weight": float(losses["aux_l1_weight"].detach().cpu().item()),
             "vq_loss": float(losses["vq_loss"].detach().cpu().item()),
             "align_loss": float(losses["align_loss"].detach().cpu().item()),
             "align_loss_raw": float(losses["align_loss_raw"].detach().cpu().item()),
@@ -298,6 +325,8 @@ def main():
         if step == 1 or step % args.log_freq == 0 or step == args.steps:
             print(
                 f"step:{step} loss:{item['loss']:.4f} recon:{item['recon_loss']:.4f} "
+                f"freq:{item['freq_loss']:.4f} aux_l1:{item['aux_l1_loss']:.4f} "
+                f"aux_w:{item['aux_l1_weight']:.4f} "
                 f"vq:{item['vq_loss']:.4f} align:{item['align_loss']:.4f} "
                 f"align_raw:{item['align_loss_raw']:.4f} w:{item['align_weight']:.4f} "
                 f"lr:{item['lr']:.6e}",
