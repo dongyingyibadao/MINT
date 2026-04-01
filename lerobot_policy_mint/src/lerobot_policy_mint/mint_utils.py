@@ -656,9 +656,11 @@ class MultiScaleVQVAE(nn.Module):
         tokenizer_align_warmup_steps: int = 1000,
         tokenizer_align_max_length: int = 64,
         tokenizer_aux_l1_weight: float = 1.0,
+        tokenizer_vq_weight: float = 1.0,
         tokenizer_spectral_weight: float = 1.0,
         tokenizer_spectral_exclude_last_dim: bool = True,
         tokenizer_spectral_scale_weights: Optional[Sequence[float]] = None,
+        tokenizer_spectral_normalize_by_scale_sum: bool = True,
 
     ):
         super().__init__()
@@ -720,8 +722,10 @@ class MultiScaleVQVAE(nn.Module):
         self.tokenizer_align_warmup_steps = tokenizer_align_warmup_steps
         self.tokenizer_align_max_length = tokenizer_align_max_length
         self.tokenizer_aux_l1_weight = float(tokenizer_aux_l1_weight)
+        self.tokenizer_vq_weight = float(tokenizer_vq_weight)
         self.tokenizer_spectral_weight = float(tokenizer_spectral_weight)
         self.tokenizer_spectral_exclude_last_dim = bool(tokenizer_spectral_exclude_last_dim)
+        self.tokenizer_spectral_normalize_by_scale_sum = bool(tokenizer_spectral_normalize_by_scale_sum)
         if tokenizer_spectral_scale_weights is None:
             self.tokenizer_spectral_scale_weights = [1.0 for _ in self.patch_nums]
         else:
@@ -731,6 +735,12 @@ class MultiScaleVQVAE(nn.Module):
                     "tokenizer_spectral_scale_weights length must match number of scales: "
                     f"got {len(self.tokenizer_spectral_scale_weights)} vs {len(self.patch_nums)}"
                 )
+            if any(w < 0.0 for w in self.tokenizer_spectral_scale_weights):
+                raise ValueError("tokenizer_spectral_scale_weights must be non-negative")
+        if sum(self.tokenizer_spectral_scale_weights) <= 0.0:
+            raise ValueError("tokenizer_spectral_scale_weights sum must be > 0")
+        if self.tokenizer_vq_weight <= 0.0:
+            raise ValueError("tokenizer_vq_weight must be > 0")
 
         self.align_action_proj = None
         self.align_text_proj = None
@@ -843,12 +853,19 @@ class MultiScaleVQVAE(nn.Module):
         _, tgt_spec = self._select_spectral_channels(rec_scales[-1], tgt)
         tgt_freq = self._dct_ii_along_time(tgt_spec)
 
-        freq_loss = torch.zeros((), device=tgt.device, dtype=tgt.dtype)
+        weighted_freq_sum = torch.zeros((), device=tgt.device, dtype=tgt.dtype)
+        scale_weight_sum = 0.0
         for scale_idx, rec_k in enumerate(rec_scales):
             rec_spec, _ = self._select_spectral_channels(rec_k, tgt)
             rec_freq = self._dct_ii_along_time(rec_spec)
             scale_weight = self.tokenizer_spectral_scale_weights[scale_idx]
-            freq_loss = freq_loss + float(scale_weight) * F.mse_loss(rec_freq, tgt_freq)
+            weighted_freq_sum = weighted_freq_sum + float(scale_weight) * F.mse_loss(rec_freq, tgt_freq)
+            scale_weight_sum += float(scale_weight)
+
+        if self.tokenizer_spectral_normalize_by_scale_sum:
+            freq_loss = weighted_freq_sum / max(scale_weight_sum, 1e-8)
+        else:
+            freq_loss = weighted_freq_sum
 
         return freq_loss * self.tokenizer_spectral_weight
 
@@ -953,7 +970,7 @@ class MultiScaleVQVAE(nn.Module):
         text_embeds: Optional[torch.Tensor] = None,
         global_step: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
-        rec, _, vq_loss, rec_scales, aux = self.forward(
+        rec, _, raw_vq_loss, rec_scales, aux = self.forward(
             inp,
             ret_usages=False,
             ret_ms_l1=True,
@@ -967,21 +984,26 @@ class MultiScaleVQVAE(nn.Module):
         freq_loss = self._compute_scalewise_spectral_loss(rec_scales, tgt)
         aux_l1_loss = self._compute_aux_time_recon_loss(rec, tgt)
         weighted_aux_l1 = aux_l1_loss * self.tokenizer_aux_l1_weight
+        weighted_vq_loss = raw_vq_loss * self.tokenizer_vq_weight
 
-        align_loss = aux.get("align_loss", torch.zeros_like(vq_loss))
-        total_loss = freq_loss + vq_loss + weighted_aux_l1 + align_loss
+        align_loss = aux.get("align_loss", torch.zeros_like(raw_vq_loss))
+        total_loss = freq_loss + weighted_vq_loss + weighted_aux_l1 + align_loss
         return {
             "loss": total_loss,
             "recon_loss": weighted_aux_l1,
             "freq_loss": freq_loss,
             "aux_l1_loss": aux_l1_loss,
             "aux_l1_weight": torch.tensor(
-                self.tokenizer_aux_l1_weight, device=vq_loss.device, dtype=vq_loss.dtype
+                self.tokenizer_aux_l1_weight, device=raw_vq_loss.device, dtype=raw_vq_loss.dtype
             ),
-            "vq_loss": vq_loss,
+            "vq_loss": weighted_vq_loss,
+            "vq_loss_raw": raw_vq_loss,
+            "vq_weight": torch.tensor(
+                self.tokenizer_vq_weight, device=raw_vq_loss.device, dtype=raw_vq_loss.dtype
+            ),
             "align_loss": align_loss,
-            "align_loss_raw": aux.get("align_loss_raw", torch.zeros_like(vq_loss)),
-            "align_weight": aux.get("align_weight", torch.zeros_like(vq_loss)),
+            "align_loss_raw": aux.get("align_loss_raw", torch.zeros_like(raw_vq_loss)),
+            "align_weight": aux.get("align_weight", torch.zeros_like(raw_vq_loss)),
         }
 
     def inp_to_idxBl(self, inp_seq_no_grad: torch.Tensor, patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:

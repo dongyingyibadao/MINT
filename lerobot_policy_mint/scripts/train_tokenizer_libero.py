@@ -139,6 +139,7 @@ def build_model(args, device):
         ch=args.ch,
         patch_nums=(1, 2, 4),
         ch_mult=(2, 4, 8),
+        beta=args.vq_beta,
         patchwise={"enable": True, "d_embed": 8, "grouped_depth": 2, "norm": "layer"},
         tokenizer_align_enable=args.align,
         tokenizer_align_model_name=args.align_model,
@@ -148,9 +149,11 @@ def build_model(args, device):
         tokenizer_align_warmup_steps=args.align_warmup,
         tokenizer_align_max_length=args.align_max_len,
         tokenizer_aux_l1_weight=args.aux_l1_weight,
+        tokenizer_vq_weight=args.vq_weight,
         tokenizer_spectral_weight=args.spectral_weight,
         tokenizer_spectral_exclude_last_dim=not args.include_gripper_in_spectral,
         tokenizer_spectral_scale_weights=spectral_scale_weights,
+        tokenizer_spectral_normalize_by_scale_sum=not args.disable_spectral_scale_normalization,
     )
     if args.tokenizer_ckpt:
         model.load_vqvae_weights(args.tokenizer_ckpt)
@@ -206,12 +209,19 @@ def parse_args():
     p.add_argument("--align_max_len", type=int, default=64)
 
     p.add_argument("--aux_l1_weight", type=float, default=1.0)
+    p.add_argument("--vq_weight", type=float, default=1.0)
+    p.add_argument("--vq_beta", type=float, default=0.25)
     p.add_argument("--spectral_weight", type=float, default=1.0)
     p.add_argument(
         "--spectral_scale_weights",
         type=str,
         default="",
         help="Comma-separated per-scale weights for spectral loss (e.g., '1,1,1').",
+    )
+    p.add_argument(
+        "--disable_spectral_scale_normalization",
+        action="store_true",
+        help="If set, do not normalize spectral loss by sum of scale weights.",
     )
     p.add_argument(
         "--include_gripper_in_spectral",
@@ -315,6 +325,8 @@ def main():
             "aux_l1_loss": float(losses["aux_l1_loss"].detach().cpu().item()),
             "aux_l1_weight": float(losses["aux_l1_weight"].detach().cpu().item()),
             "vq_loss": float(losses["vq_loss"].detach().cpu().item()),
+            "vq_loss_raw": float(losses["vq_loss_raw"].detach().cpu().item()),
+            "vq_weight": float(losses["vq_weight"].detach().cpu().item()),
             "align_loss": float(losses["align_loss"].detach().cpu().item()),
             "align_loss_raw": float(losses["align_loss_raw"].detach().cpu().item()),
             "align_weight": float(losses["align_weight"].detach().cpu().item()),
@@ -327,7 +339,8 @@ def main():
                 f"step:{step} loss:{item['loss']:.4f} recon:{item['recon_loss']:.4f} "
                 f"freq:{item['freq_loss']:.4f} aux_l1:{item['aux_l1_loss']:.4f} "
                 f"aux_w:{item['aux_l1_weight']:.4f} "
-                f"vq:{item['vq_loss']:.4f} align:{item['align_loss']:.4f} "
+                f"vq:{item['vq_loss']:.4f} vq_raw:{item['vq_loss_raw']:.4f} "
+                f"vq_w:{item['vq_weight']:.4f} align:{item['align_loss']:.4f} "
                 f"align_raw:{item['align_loss_raw']:.4f} w:{item['align_weight']:.4f} "
                 f"lr:{item['lr']:.6e}",
                 flush=True,

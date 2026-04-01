@@ -90,7 +90,7 @@ accelerate launch \
   --dataset.root=/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero \
   --policy.type=mint \
   --policy.pretrained_path=huangrm/pi05_base \
-  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/checkpoints/MINT-tokenizer-libero/ms_vqvae.pth \
+  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/stageb_org_1M_true/checkpoints/200000/tokenizer.pt \
   --policy.push_to_hub=false \
   --policy.compile_model=false \
   --policy.gradient_checkpointing=true \
@@ -100,10 +100,10 @@ accelerate launch \
   --batch_size=16 \
   --log_freq=500 \
   --save_freq=2000 \
-  --output_dir=./outputs/policy_100k_org_stable_huangrm_pi05_test \
-  --job_name=policy_100k_org_stable_huangrm_pi05_test \
-  --policy.repo_id=local/policy_100k_org_stable_huangrm_pi05_test \
-  2>&1 | tee outputs/policy_100k_org_stable_huangrm_pi05_test.log
+  --output_dir=./outputs/policy_100k_org_stable_huangrm_pi05_true \
+  --job_name=policy_100k_org_stable_huangrm_pi05_true \
+  --policy.repo_id=local/policy_100k_org_stable_huangrm_pi05_true \
+  2>&1 | tee outputs/policy_100k_org_stable_huangrm_pi05_true.log
 
 
 
@@ -133,7 +133,7 @@ accelerate launch \
   --dataset.root=/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero \
   --policy.type=mint \
   --policy.pretrained_path=huangrm/pi05_base \
-  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/stageb_align_raw_600k/checkpoints/last/tokenizer.pt \
+  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/stageb_raw_align_1M_run_true/checkpoints/200000/tokenizer.pt \
   --policy.push_to_hub=false \
   --policy.compile_model=false \
   --policy.gradient_checkpointing=true \
@@ -142,10 +142,11 @@ accelerate launch \
   --steps=200000 \
   --batch_size=16 \
   --log_freq=500 \
-  --output_dir=./outputs/policy_200k_raw_stable_huangrm_pi05 \
-  --job_name=policy_200k_raw_stable_huangrm_pi05 \
-  --policy.repo_id=local/policy_200k_raw_stable_huangrm_pi05 \
-  2>&1 | tee outputs/policy_200k_raw_stable_huangrm_pi05.log
+  --save_freq=2000 \
+  --output_dir=./outputs/policy_200k_raw_stable_huangrm_pi05_true \
+  --job_name=policy_200k_raw_stable_huangrm_pi05_true \
+  --policy.repo_id=local/policy_200k_raw_stable_huangrm_pi05_true \
+  2>&1 | tee outputs/policy_200k_raw_stable_huangrm_pi05_true.log
  ```
 
  库自检
