@@ -653,7 +653,21 @@ class MultiScaleVQVAE(nn.Module):
         tokenizer_align_proj_dim: int = 256,
         tokenizer_align_temperature: float = 0.07,
         tokenizer_align_weight: float = 0.1,
+        tokenizer_align_global_weight: Optional[float] = None,
+        tokenizer_align_local_weight: float = 0.0,
+        tokenizer_align_local_mode: str = "window",
+        tokenizer_align_local_action_window_sizes: Optional[Sequence[int]] = None,
+        tokenizer_align_local_text_window_sizes: Optional[Sequence[int]] = None,
+        tokenizer_align_local_topk: int = 2,
+        tokenizer_align_local_window_temperature: float = 0.07,
+        tokenizer_align_order_weight: float = 0.0,
+        tokenizer_align_order_mode: str = "window",
+        tokenizer_align_order_window_temperature: float = 0.07,
+        tokenizer_align_quant_weight: float = 1.0,
+        tokenizer_align_encoder_weight: float = 1.0,
+        tokenizer_align_order_margin: float = 0.02,
         tokenizer_align_warmup_steps: int = 1000,
+        tokenizer_align_order_warmup_steps: int = 3000,
         tokenizer_align_max_length: int = 64,
         tokenizer_aux_l1_weight: float = 1.0,
         tokenizer_vq_weight: float = 1.0,
@@ -719,7 +733,31 @@ class MultiScaleVQVAE(nn.Module):
         self.tokenizer_align_proj_dim = tokenizer_align_proj_dim
         self.tokenizer_align_temperature = tokenizer_align_temperature
         self.tokenizer_align_weight = tokenizer_align_weight
+        if tokenizer_align_global_weight is None:
+            tokenizer_align_global_weight = tokenizer_align_weight
+        self.tokenizer_align_global_weight = float(tokenizer_align_global_weight)
+        self.tokenizer_align_local_weight = float(tokenizer_align_local_weight)
+        self.tokenizer_align_local_mode = str(tokenizer_align_local_mode).lower()
+        if tokenizer_align_local_action_window_sizes is None:
+            tokenizer_align_local_action_window_sizes = (1, 2)
+        if tokenizer_align_local_text_window_sizes is None:
+            tokenizer_align_local_text_window_sizes = (1, 2, 3)
+        self.tokenizer_align_local_action_window_sizes = tuple(
+            int(x) for x in tokenizer_align_local_action_window_sizes
+        )
+        self.tokenizer_align_local_text_window_sizes = tuple(
+            int(x) for x in tokenizer_align_local_text_window_sizes
+        )
+        self.tokenizer_align_local_topk = int(tokenizer_align_local_topk)
+        self.tokenizer_align_local_window_temperature = float(tokenizer_align_local_window_temperature)
+        self.tokenizer_align_order_weight = float(tokenizer_align_order_weight)
+        self.tokenizer_align_order_mode = str(tokenizer_align_order_mode).lower()
+        self.tokenizer_align_order_window_temperature = float(tokenizer_align_order_window_temperature)
+        self.tokenizer_align_quant_weight = float(tokenizer_align_quant_weight)
+        self.tokenizer_align_encoder_weight = float(tokenizer_align_encoder_weight)
+        self.tokenizer_align_order_margin = float(tokenizer_align_order_margin)
         self.tokenizer_align_warmup_steps = tokenizer_align_warmup_steps
+        self.tokenizer_align_order_warmup_steps = tokenizer_align_order_warmup_steps
         self.tokenizer_align_max_length = tokenizer_align_max_length
         self.tokenizer_aux_l1_weight = float(tokenizer_aux_l1_weight)
         self.tokenizer_vq_weight = float(tokenizer_vq_weight)
@@ -741,6 +779,38 @@ class MultiScaleVQVAE(nn.Module):
             raise ValueError("tokenizer_spectral_scale_weights sum must be > 0")
         if self.tokenizer_vq_weight <= 0.0:
             raise ValueError("tokenizer_vq_weight must be > 0")
+        if self.tokenizer_align_temperature <= 0.0:
+            raise ValueError("tokenizer_align_temperature must be > 0")
+        if self.tokenizer_align_global_weight < 0.0:
+            raise ValueError("tokenizer_align_global_weight must be >= 0")
+        if self.tokenizer_align_local_weight < 0.0:
+            raise ValueError("tokenizer_align_local_weight must be >= 0")
+        if self.tokenizer_align_local_mode not in {"token", "window"}:
+            raise ValueError("tokenizer_align_local_mode must be one of {'token', 'window'}")
+        if len(self.tokenizer_align_local_action_window_sizes) == 0:
+            raise ValueError("tokenizer_align_local_action_window_sizes cannot be empty")
+        if len(self.tokenizer_align_local_text_window_sizes) == 0:
+            raise ValueError("tokenizer_align_local_text_window_sizes cannot be empty")
+        if any(x <= 0 for x in self.tokenizer_align_local_action_window_sizes):
+            raise ValueError("tokenizer_align_local_action_window_sizes must contain positive integers")
+        if any(x <= 0 for x in self.tokenizer_align_local_text_window_sizes):
+            raise ValueError("tokenizer_align_local_text_window_sizes must contain positive integers")
+        if self.tokenizer_align_local_topk <= 0:
+            raise ValueError("tokenizer_align_local_topk must be > 0")
+        if self.tokenizer_align_local_window_temperature <= 0.0:
+            self.tokenizer_align_local_window_temperature = self.tokenizer_align_temperature
+        if self.tokenizer_align_order_weight < 0.0:
+            raise ValueError("tokenizer_align_order_weight must be >= 0")
+        if self.tokenizer_align_order_mode not in {"token", "window"}:
+            raise ValueError("tokenizer_align_order_mode must be one of {'token', 'window'}")
+        if self.tokenizer_align_order_window_temperature <= 0.0:
+            self.tokenizer_align_order_window_temperature = self.tokenizer_align_temperature
+        if self.tokenizer_align_quant_weight < 0.0:
+            raise ValueError("tokenizer_align_quant_weight must be >= 0")
+        if self.tokenizer_align_encoder_weight < 0.0:
+            raise ValueError("tokenizer_align_encoder_weight must be >= 0")
+        if self.tokenizer_align_order_margin < 0.0:
+            raise ValueError("tokenizer_align_order_margin must be >= 0")
 
         self.align_action_proj = None
         self.align_text_proj = None
@@ -775,7 +845,7 @@ class MultiScaleVQVAE(nn.Module):
         return summed / denom
 
     @torch.no_grad()
-    def encode_texts(self, texts: List[str], device: Optional[torch.device] = None) -> torch.Tensor:
+    def encode_text_features(self, texts: List[str], device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
         if not self.tokenizer_align_enable or self.text_encoder is None or self.text_tokenizer is None:
             raise RuntimeError("Text encoder is not initialized. Set tokenizer_align_enable=True.")
         if len(texts) == 0:
@@ -793,7 +863,15 @@ class MultiScaleVQVAE(nn.Module):
 
         self.text_encoder = self.text_encoder.to(dev)
         out = self.text_encoder(**tokenized)
-        return self._masked_mean_pool(out.last_hidden_state, tokenized["attention_mask"])
+        return {
+            "text_global": self._masked_mean_pool(out.last_hidden_state, tokenized["attention_mask"]),
+            "text_tokens": out.last_hidden_state,
+            "text_mask": tokenized["attention_mask"].bool(),
+        }
+
+    @torch.no_grad()
+    def encode_texts(self, texts: List[str], device: Optional[torch.device] = None) -> torch.Tensor:
+        return self.encode_text_features(texts, device=device)["text_global"]
 
     def encode_to_latent(self, inp: torch.Tensor) -> torch.Tensor:
         x = inp
@@ -801,19 +879,46 @@ class MultiScaleVQVAE(nn.Module):
             x = self.patchwise_embed(x)
         return self.quant_conv(self.encoder(x))
 
+    def latent_to_s1_embeddings(self, latent: torch.Tensor) -> torch.Tensor:
+        # Hard assignment to discrete codes is non-differentiable; detach latent to avoid redundant encoder graph.
+        idx_scales = self.quantizer.f_to_idxBl_or_fhat(latent.detach(), to_fhat=False, patch_nums=self.patch_nums)
+        if len(idx_scales) == 0:
+            raise RuntimeError("No quantized scales returned when extracting S1 embeddings.")
+        s1_idx = idx_scales[0]
+        return self.quantizer.embedding(s1_idx)
+
+    def latent_to_s1_token_pair(self, latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return quantized S1 tokens and an ST proxy that backpropagates to encoder tokens."""
+        s1_quant = self.latent_to_s1_embeddings(latent)
+        s1_len = int(self.patch_nums[0])
+        if latent.shape[-1] != s1_len:
+            s1_encoder_bcl = F.interpolate(latent, size=s1_len, mode=self.quantizer.downsample_mode)
+        else:
+            s1_encoder_bcl = latent
+        s1_encoder = s1_encoder_bcl.transpose(1, 2).contiguous()
+        s1_encoder_st = s1_encoder + (s1_quant - s1_encoder).detach()
+        return s1_quant, s1_encoder_st
+
+    def inp_to_s1_embeddings(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.latent_to_s1_embeddings(self.encode_to_latent(inp))
+
+    def inp_to_s1_token_pair(self, inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.latent_to_s1_token_pair(self.encode_to_latent(inp))
+
     def decode_from_latent(self, f_hat: torch.Tensor) -> torch.Tensor:
         rec = self.decoder(self.post_quant_conv(f_hat))
         if self.patchwise_proj is not None:
             rec = self.patchwise_proj(rec)
         return rec
 
-    def _get_align_weight(self, global_step: Optional[int]) -> float:
-        if self.tokenizer_align_warmup_steps <= 0:
-            return float(self.tokenizer_align_weight)
+    @staticmethod
+    def _get_warmup_weight(base_weight: float, warmup_steps: int, global_step: Optional[int]) -> float:
+        if warmup_steps <= 0:
+            return float(base_weight)
         if global_step is None:
-            return float(self.tokenizer_align_weight)
-        ratio = min(1.0, float(global_step) / float(self.tokenizer_align_warmup_steps))
-        return float(self.tokenizer_align_weight) * ratio
+            return float(base_weight)
+        ratio = min(1.0, float(global_step) / float(warmup_steps))
+        return float(base_weight) * ratio
 
     @staticmethod
     def _dct_ii_along_time(x: torch.Tensor) -> torch.Tensor:
@@ -846,7 +951,18 @@ class MultiScaleVQVAE(nn.Module):
 
         return rec[..., :min_dim], tgt[..., :min_dim]
 
-    def _compute_scalewise_spectral_loss(self, rec_scales: List[torch.Tensor], tgt: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return values.mean()
+        m = mask.to(values.device)
+        if m.dtype != torch.bool:
+            m = m > 0
+        m = m.to(values.dtype)
+        denom = m.sum().clamp(min=1.0)
+        return (values * m).sum() / denom
+
+    def _compute_scalewise_spectral_loss_core(self, rec_scales: List[torch.Tensor], tgt: torch.Tensor) -> torch.Tensor:
         if len(rec_scales) == 0:
             raise ValueError("rec_scales cannot be empty for spectral loss computation")
 
@@ -869,47 +985,359 @@ class MultiScaleVQVAE(nn.Module):
 
         return freq_loss * self.tokenizer_spectral_weight
 
-    @staticmethod
-    def _compute_aux_time_recon_loss(rec: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    def _compute_scalewise_spectral_loss(
+        self,
+        rec_scales: List[torch.Tensor],
+        tgt: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if action_mask is None:
+            return self._compute_scalewise_spectral_loss_core(rec_scales, tgt)
+
+        mask = action_mask.to(tgt.device)
+        if mask.dtype != torch.bool:
+            mask = mask > 0
+
+        B = tgt.shape[0]
+        losses = []
+        for b in range(B):
+            valid_len = int(mask[b].sum().item())
+            if valid_len <= 1:
+                continue
+            rec_b = [rk[b : b + 1, :valid_len] for rk in rec_scales]
+            tgt_b = tgt[b : b + 1, :valid_len]
+            losses.append(self._compute_scalewise_spectral_loss_core(rec_b, tgt_b))
+        if len(losses) == 0:
+            return torch.zeros((), device=tgt.device, dtype=tgt.dtype)
+        return torch.stack(losses).mean()
+
+    def _compute_aux_time_recon_loss(
+        self,
+        rec: torch.Tensor,
+        tgt: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Auxiliary time-domain reconstruction term (paper's L1 term, with gripper CE compatibility)."""
+        mask = None
+        if action_mask is not None:
+            mask = action_mask.to(rec.device)
+            if mask.dtype != torch.bool:
+                mask = mask > 0
+
         if rec.shape[-1] == 8 and tgt.shape[-1] == 7:
-            recon_cont = F.l1_loss(rec[..., :6], tgt[..., :6])
+            recon_cont = (rec[..., :6] - tgt[..., :6]).abs().mean(dim=-1)
+            recon_cont = self._masked_mean(recon_cont, mask)
             grip_target = (tgt[..., 6] > 0).long()
             grip_logits = rec[..., 6:8].reshape(-1, 2)
-            recon_grip = F.cross_entropy(grip_logits, grip_target.reshape(-1))
+            grip_loss = F.cross_entropy(grip_logits, grip_target.reshape(-1), reduction="none").reshape(tgt.shape[0], -1)
+            recon_grip = self._masked_mean(grip_loss, mask)
             return recon_cont + recon_grip
 
         min_dim = min(rec.shape[-1], tgt.shape[-1])
-        return F.l1_loss(rec[..., :min_dim], tgt[..., :min_dim])
+        l1 = (rec[..., :min_dim] - tgt[..., :min_dim]).abs().mean(dim=-1)
+        return self._masked_mean(l1, mask)
+
+    @staticmethod
+    def _build_bool_mask(mask: Optional[torch.Tensor], shape: Tuple[int, int], device: torch.device) -> torch.Tensor:
+        if mask is None:
+            return torch.ones(shape, device=device, dtype=torch.bool)
+        m = mask.to(device)
+        if m.dtype != torch.bool:
+            m = m > 0
+        return m
+
+    def _compute_local_pair_logits(
+        self,
+        action_tok_feat: torch.Tensor,
+        text_tok_feat: torch.Tensor,
+        action_mask: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Pairwise token sim across batch: [i, j, t, l]
+        sim = torch.einsum("itc,jlc->ijtl", action_tok_feat, text_tok_feat)
+        sim = sim.masked_fill(~text_mask[None, :, None, :], -1e4)
+
+        best_text = sim.max(dim=-1).values
+        best_text = best_text.masked_fill(~action_mask[:, None, :], 0.0)
+        denom = action_mask[:, None, :].to(best_text.dtype).sum(dim=-1).clamp(min=1.0)
+        return best_text.sum(dim=-1) / denom
+
+    def _build_action_causal_windows(
+        self,
+        action_tok_feat: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, T, C = action_tok_feat.shape
+        win_sizes = self.tokenizer_align_local_action_window_sizes
+        total_windows = len(win_sizes) * T
+        win_feat = action_tok_feat.new_zeros((B, total_windows, C))
+        win_mask = torch.zeros((B, total_windows), dtype=torch.bool, device=action_tok_feat.device)
+
+        w_idx = 0
+        for ws in win_sizes:
+            for end in range(T):
+                start = end - ws + 1
+                if start < 0:
+                    w_idx += 1
+                    continue
+                segment_mask = action_mask[:, start : end + 1]
+                valid = segment_mask.all(dim=1)
+                if valid.any():
+                    segment_feat = action_tok_feat[:, start : end + 1].mean(dim=1)
+                    win_feat[valid, w_idx] = segment_feat[valid]
+                    win_mask[valid, w_idx] = True
+                w_idx += 1
+        return win_feat, win_mask
+
+    def _build_text_windows(
+        self,
+        text_tok_feat: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, C = text_tok_feat.shape
+        win_sizes = self.tokenizer_align_local_text_window_sizes
+        total_windows = sum(max(0, L - ws + 1) for ws in win_sizes)
+        win_feat = text_tok_feat.new_zeros((B, total_windows, C))
+        win_mask = torch.zeros((B, total_windows), dtype=torch.bool, device=text_tok_feat.device)
+
+        w_idx = 0
+        for ws in win_sizes:
+            max_start = L - ws
+            if max_start < 0:
+                continue
+            for start in range(max_start + 1):
+                end = start + ws
+                segment_mask = text_mask[:, start:end]
+                valid = segment_mask.all(dim=1)
+                if valid.any():
+                    segment_feat = text_tok_feat[:, start:end].mean(dim=1)
+                    win_feat[valid, w_idx] = segment_feat[valid]
+                    win_mask[valid, w_idx] = True
+                w_idx += 1
+        return win_feat, win_mask
+
+    def _compute_local_pair_logits_window(
+        self,
+        action_tok_feat: torch.Tensor,
+        text_tok_feat: torch.Tensor,
+        action_mask: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        action_win_feat, action_win_mask = self._build_action_causal_windows(action_tok_feat, action_mask)
+        text_win_feat, text_win_mask = self._build_text_windows(text_tok_feat, text_mask)
+
+        if text_win_feat.shape[1] == 0:
+            b = action_tok_feat.shape[0]
+            return action_tok_feat.new_zeros((b, b))
+
+        # Pairwise action-window vs text-window sim across batch: [i, j, wa, wt]
+        sim = torch.einsum("itc,jlc->ijtl", action_win_feat, text_win_feat)
+        sim = sim.masked_fill(~text_win_mask[None, :, None, :], -1e4)
+
+        k = min(self.tokenizer_align_local_topk, sim.shape[-1])
+        if k <= 0:
+            b = action_tok_feat.shape[0]
+            return action_tok_feat.new_zeros((b, b))
+        top_vals, _ = sim.topk(k=k, dim=-1)
+        w = F.softmax(top_vals / self.tokenizer_align_local_window_temperature, dim=-1)
+        selected = (w * top_vals).sum(dim=-1)
+
+        selected = selected.masked_fill(~action_win_mask[:, None, :], 0.0)
+        denom = action_win_mask[:, None, :].to(selected.dtype).sum(dim=-1).clamp(min=1.0)
+        return selected.sum(dim=-1) / denom
+
+    def _compute_order_loss(
+        self,
+        action_tok_feat: torch.Tensor,
+        text_tok_feat: torch.Tensor,
+        action_mask: torch.Tensor,
+        text_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.tokenizer_align_order_mode == "window":
+            text_win_feat, text_win_mask = self._build_text_windows(text_tok_feat, text_mask)
+            if text_win_feat.shape[1] == 0:
+                return torch.zeros((), device=action_tok_feat.device, dtype=action_tok_feat.dtype)
+
+            sim = torch.einsum("btc,blc->btl", action_tok_feat, text_win_feat)
+            sim = sim.masked_fill(~text_win_mask[:, None, :], -1e4)
+            attn = F.softmax(sim / self.tokenizer_align_order_window_temperature, dim=-1)
+            attn = attn * text_win_mask[:, None, :].to(attn.dtype)
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+            L = text_tok_feat.shape[1]
+            denom = float(max(1, L - 1))
+            centers = []
+            for ws in self.tokenizer_align_local_text_window_sizes:
+                max_start = L - ws
+                if max_start < 0:
+                    continue
+                for start in range(max_start + 1):
+                    center = float(start + (ws - 1) * 0.5) / denom
+                    centers.append(center)
+            pos = torch.tensor(centers, device=attn.device, dtype=attn.dtype)
+            expected_pos = (attn * pos[None, None, :]).sum(dim=-1)
+        else:
+            sim = torch.einsum("btc,blc->btl", action_tok_feat, text_tok_feat)
+            sim = sim.masked_fill(~text_mask[:, None, :], -1e4)
+            attn = F.softmax(sim / self.tokenizer_align_temperature, dim=-1)
+            attn = attn * text_mask[:, None, :].to(attn.dtype)
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+            L = text_tok_feat.shape[1]
+            pos = torch.linspace(0.0, 1.0, steps=L, device=attn.device, dtype=attn.dtype)
+            expected_pos = (attn * pos[None, None, :]).sum(dim=-1)
+
+        valid_pair = action_mask[:, :-1] & action_mask[:, 1:]
+        if valid_pair.sum() == 0:
+            return torch.zeros((), device=attn.device, dtype=attn.dtype)
+
+        violations = F.relu(expected_pos[:, :-1] - expected_pos[:, 1:] + self.tokenizer_align_order_margin)
+        return self._masked_mean(violations, valid_pair)
 
     def compute_align_loss(
         self,
-        action_latent: torch.Tensor,
-        text_latent: torch.Tensor,
+        action_tokens: torch.Tensor,
+        text_global: torch.Tensor,
+        text_tokens: Optional[torch.Tensor] = None,
+        text_mask: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
         global_step: Optional[int] = None,
+        action_tokens_encoder_st: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if self.align_action_proj is None or self.align_text_proj is None:
             raise RuntimeError("Align projection heads are not initialized.")
-        if action_latent.shape[0] != text_latent.shape[0]:
+        if action_tokens.shape[0] != text_global.shape[0]:
             raise ValueError(
-                f"Batch size mismatch for alignment: action={action_latent.shape[0]}, text={text_latent.shape[0]}"
+                f"Batch size mismatch for alignment: action={action_tokens.shape[0]}, text={text_global.shape[0]}"
             )
+        if action_tokens_encoder_st is not None:
+            if action_tokens_encoder_st.shape != action_tokens.shape:
+                raise ValueError(
+                    "action_tokens_encoder_st must have the same shape as action_tokens: "
+                    f"got {tuple(action_tokens_encoder_st.shape)} vs {tuple(action_tokens.shape)}"
+                )
 
-        action_feat = F.normalize(self.align_action_proj(action_latent), dim=-1)
-        text_feat = F.normalize(self.align_text_proj(text_latent), dim=-1)
-        logits = (action_feat @ text_feat.transpose(0, 1)) / self.tokenizer_align_temperature
-        labels = torch.arange(logits.shape[0], device=logits.device)
+        def _compute_single(curr_tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+            dev = curr_tokens.device
+            B, T, _ = curr_tokens.shape
+            action_mask_bool = self._build_bool_mask(action_mask, (B, T), dev)
 
-        loss_a2t = F.cross_entropy(logits, labels)
-        loss_t2a = F.cross_entropy(logits.transpose(0, 1), labels)
-        raw_loss = 0.5 * (loss_a2t + loss_t2a)
-        weight = self._get_align_weight(global_step)
-        weighted = raw_loss * weight
-        return {
-            "align_loss": weighted,
-            "align_loss_raw": raw_loss.detach(),
-            "align_weight": torch.tensor(weight, device=logits.device, dtype=raw_loss.dtype),
-        }
+            # Global align: demo-level action summary vs sentence summary
+            action_global = (curr_tokens * action_mask_bool.unsqueeze(-1).to(curr_tokens.dtype)).sum(dim=1)
+            action_global = action_global / action_mask_bool.sum(dim=1, keepdim=True).to(curr_tokens.dtype).clamp(min=1.0)
+            action_feat = F.normalize(self.align_action_proj(action_global), dim=-1)
+            text_feat = F.normalize(self.align_text_proj(text_global), dim=-1)
+            logits_global = (action_feat @ text_feat.transpose(0, 1)) / self.tokenizer_align_temperature
+            labels = torch.arange(logits_global.shape[0], device=logits_global.device)
+            loss_a2t = F.cross_entropy(logits_global, labels)
+            loss_t2a = F.cross_entropy(logits_global.transpose(0, 1), labels)
+            raw_global = 0.5 * (loss_a2t + loss_t2a)
+            w_global = self._get_warmup_weight(
+                self.tokenizer_align_global_weight, self.tokenizer_align_warmup_steps, global_step
+            )
+            weighted_global = raw_global * w_global
+
+            raw_local = torch.zeros_like(raw_global)
+            weighted_local = torch.zeros_like(raw_global)
+            w_local = 0.0
+            raw_order = torch.zeros_like(raw_global)
+            weighted_order = torch.zeros_like(raw_global)
+            w_order = 0.0
+
+            if text_tokens is not None:
+                _, L, _ = text_tokens.shape
+                text_mask_bool = self._build_bool_mask(text_mask, (B, L), text_tokens.device)
+
+                action_tok_feat = F.normalize(self.align_action_proj(curr_tokens), dim=-1)
+                text_tok_feat = F.normalize(self.align_text_proj(text_tokens), dim=-1)
+
+                if self.tokenizer_align_local_weight > 0.0:
+                    if self.tokenizer_align_local_mode == "window":
+                        logits_local = self._compute_local_pair_logits_window(
+                            action_tok_feat, text_tok_feat, action_mask_bool, text_mask_bool
+                        )
+                    else:
+                        logits_local = self._compute_local_pair_logits(
+                            action_tok_feat, text_tok_feat, action_mask_bool, text_mask_bool
+                        )
+                    logits_local = logits_local / self.tokenizer_align_temperature
+                    loss_local_a2t = F.cross_entropy(logits_local, labels)
+                    loss_local_t2a = F.cross_entropy(logits_local.transpose(0, 1), labels)
+                    raw_local = 0.5 * (loss_local_a2t + loss_local_t2a)
+                    w_local = self._get_warmup_weight(
+                        self.tokenizer_align_local_weight, self.tokenizer_align_warmup_steps, global_step
+                    )
+                    weighted_local = raw_local * w_local
+
+                if self.tokenizer_align_order_weight > 0.0:
+                    raw_order = self._compute_order_loss(
+                        action_tok_feat,
+                        text_tok_feat,
+                        action_mask_bool,
+                        text_mask_bool,
+                    )
+                    w_order = self._get_warmup_weight(
+                        self.tokenizer_align_order_weight,
+                        self.tokenizer_align_order_warmup_steps,
+                        global_step,
+                    )
+                    weighted_order = raw_order * w_order
+
+            weighted_total = weighted_global + weighted_local + weighted_order
+            return {
+                "align_loss": weighted_total,
+                "align_loss_raw": (raw_global + raw_local + raw_order).detach(),
+                "align_weight": torch.tensor(w_global + w_local + w_order, device=dev, dtype=raw_global.dtype),
+                "align_global_loss": weighted_global,
+                "align_global_loss_raw": raw_global.detach(),
+                "align_global_weight": torch.tensor(w_global, device=dev, dtype=raw_global.dtype),
+                "align_local_loss": weighted_local,
+                "align_local_loss_raw": raw_local.detach(),
+                "align_local_weight": torch.tensor(w_local, device=dev, dtype=raw_global.dtype),
+                "align_order_loss": weighted_order,
+                "align_order_loss_raw": raw_order.detach(),
+                "align_order_weight": torch.tensor(w_order, device=dev, dtype=raw_global.dtype),
+            }
+
+        branch_outputs: List[Dict[str, torch.Tensor]] = []
+        branch_weights: List[float] = []
+
+        if self.tokenizer_align_quant_weight > 0.0:
+            branch_outputs.append(_compute_single(action_tokens))
+            branch_weights.append(self.tokenizer_align_quant_weight)
+
+        if action_tokens_encoder_st is not None and self.tokenizer_align_encoder_weight > 0.0:
+            branch_outputs.append(_compute_single(action_tokens_encoder_st))
+            branch_weights.append(self.tokenizer_align_encoder_weight)
+
+        if len(branch_outputs) == 0:
+            zero = torch.zeros((), device=action_tokens.device, dtype=action_tokens.dtype)
+            return {
+                "align_loss": zero,
+                "align_loss_raw": zero,
+                "align_weight": zero,
+                "align_global_loss": zero,
+                "align_global_loss_raw": zero,
+                "align_global_weight": zero,
+                "align_local_loss": zero,
+                "align_local_loss_raw": zero,
+                "align_local_weight": zero,
+                "align_order_loss": zero,
+                "align_order_loss_raw": zero,
+                "align_order_weight": zero,
+            }
+
+        if len(branch_outputs) == 1:
+            return branch_outputs[0]
+
+        weight_sum = sum(branch_weights)
+        mixed: Dict[str, torch.Tensor] = {}
+        for key in branch_outputs[0].keys():
+            acc = torch.zeros_like(branch_outputs[0][key])
+            for out_dict, w in zip(branch_outputs, branch_weights):
+                acc = acc + out_dict[key] * float(w)
+            mixed[key] = acc / float(weight_sum)
+        return mixed
 
 
     def forward(
@@ -917,6 +1345,7 @@ class MultiScaleVQVAE(nn.Module):
         inp,
         ret_usages: bool = False,
         ret_ms_l1: bool = False,
+        action_mask: Optional[torch.Tensor] = None,
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None,
         global_step: Optional[int] = None,
@@ -927,21 +1356,55 @@ class MultiScaleVQVAE(nn.Module):
         _ = SN
 
         aux: Dict[str, torch.Tensor] = {}
-        if self.tokenizer_align_enable:
-            txt = text_embeds
-            if txt is None and texts is not None:
-                txt = self.encode_texts(texts, device=f.device)
-            if txt is not None:
-                if txt.device != f.device:
-                    txt = txt.to(f.device)
-                action_latent = f.mean(dim=-1)
-                aux.update(self.compute_align_loss(action_latent, txt, global_step=global_step))
 
         q_out = self.quantizer(
             f,
             ret_usages=ret_usages,
             ret_fhat_scales=ret_ms_l1,
         )
+
+        if self.tokenizer_align_enable:
+            txt_global = text_embeds
+            txt_tokens = None
+            txt_mask = None
+
+            if texts is not None:
+                txt_feat = self.encode_text_features(texts, device=f.device)
+                txt_global = txt_feat["text_global"]
+                txt_tokens = txt_feat["text_tokens"]
+                txt_mask = txt_feat["text_mask"]
+
+            if txt_global is not None:
+                if txt_global.device != f.device:
+                    txt_global = txt_global.to(f.device)
+                if txt_tokens is not None and txt_tokens.device != f.device:
+                    txt_tokens = txt_tokens.to(f.device)
+                if txt_mask is not None and txt_mask.device != f.device:
+                    txt_mask = txt_mask.to(f.device)
+
+                action_tokens, action_tokens_encoder_st = self.latent_to_s1_token_pair(f)
+                align_action_mask = action_mask
+                if align_action_mask is not None:
+                    align_action_mask = align_action_mask.to(f.device)
+                    if align_action_mask.dtype != torch.bool:
+                        align_action_mask = align_action_mask > 0
+                    if align_action_mask.shape[1] != action_tokens.shape[1]:
+                        align_action_mask = F.interpolate(
+                            align_action_mask.float().unsqueeze(1),
+                            size=action_tokens.shape[1],
+                            mode="nearest",
+                        ).squeeze(1) > 0.5
+                aux.update(
+                    self.compute_align_loss(
+                        action_tokens=action_tokens,
+                        text_global=txt_global,
+                        text_tokens=txt_tokens,
+                        text_mask=txt_mask,
+                        action_mask=align_action_mask,
+                        global_step=global_step,
+                        action_tokens_encoder_st=action_tokens_encoder_st,
+                    )
+                )
         if ret_ms_l1:
             # quantizer returns 4-tuple when ret_fhat_scales=True
             f_hat, usages, vq_loss, fhat_scales = q_out
@@ -966,6 +1429,7 @@ class MultiScaleVQVAE(nn.Module):
         self,
         inp: torch.Tensor,
         target: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None,
         global_step: Optional[int] = None,
@@ -974,6 +1438,7 @@ class MultiScaleVQVAE(nn.Module):
             inp,
             ret_usages=False,
             ret_ms_l1=True,
+            action_mask=action_mask,
             texts=texts,
             text_embeds=text_embeds,
             global_step=global_step,
@@ -981,8 +1446,8 @@ class MultiScaleVQVAE(nn.Module):
         )
 
         tgt = inp if target is None else target
-        freq_loss = self._compute_scalewise_spectral_loss(rec_scales, tgt)
-        aux_l1_loss = self._compute_aux_time_recon_loss(rec, tgt)
+        freq_loss = self._compute_scalewise_spectral_loss(rec_scales, tgt, action_mask=action_mask)
+        aux_l1_loss = self._compute_aux_time_recon_loss(rec, tgt, action_mask=action_mask)
         weighted_aux_l1 = aux_l1_loss * self.tokenizer_aux_l1_weight
         weighted_vq_loss = raw_vq_loss * self.tokenizer_vq_weight
 
@@ -1004,6 +1469,15 @@ class MultiScaleVQVAE(nn.Module):
             "align_loss": align_loss,
             "align_loss_raw": aux.get("align_loss_raw", torch.zeros_like(raw_vq_loss)),
             "align_weight": aux.get("align_weight", torch.zeros_like(raw_vq_loss)),
+            "align_global_loss": aux.get("align_global_loss", torch.zeros_like(raw_vq_loss)),
+            "align_global_loss_raw": aux.get("align_global_loss_raw", torch.zeros_like(raw_vq_loss)),
+            "align_global_weight": aux.get("align_global_weight", torch.zeros_like(raw_vq_loss)),
+            "align_local_loss": aux.get("align_local_loss", torch.zeros_like(raw_vq_loss)),
+            "align_local_loss_raw": aux.get("align_local_loss_raw", torch.zeros_like(raw_vq_loss)),
+            "align_local_weight": aux.get("align_local_weight", torch.zeros_like(raw_vq_loss)),
+            "align_order_loss": aux.get("align_order_loss", torch.zeros_like(raw_vq_loss)),
+            "align_order_loss_raw": aux.get("align_order_loss_raw", torch.zeros_like(raw_vq_loss)),
+            "align_order_weight": aux.get("align_order_weight", torch.zeros_like(raw_vq_loss)),
         }
 
     def inp_to_idxBl(self, inp_seq_no_grad: torch.Tensor, patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None) -> List[torch.LongTensor]:

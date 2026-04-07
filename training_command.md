@@ -133,20 +133,62 @@ accelerate launch \
   --dataset.root=/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero \
   --policy.type=mint \
   --policy.pretrained_path=huangrm/pi05_base \
-  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/stageb_raw_align_1M_run_true/checkpoints/200000/tokenizer.pt \
+  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/AAAstageb_framework_align_encoder_only_resume_lr1e5_to300k/checkpoints/last/tokenizer.pt \
   --policy.push_to_hub=false \
   --policy.compile_model=false \
   --policy.gradient_checkpointing=true \
   --policy.dtype=bfloat16 \
   --policy.device=cuda \
-  --steps=200000 \
+  --steps=60000 \
   --batch_size=16 \
   --log_freq=500 \
   --save_freq=2000 \
-  --output_dir=./outputs/policy_200k_raw_stable_huangrm_pi05_true \
-  --job_name=policy_200k_raw_stable_huangrm_pi05_true \
-  --policy.repo_id=local/policy_200k_raw_stable_huangrm_pi05_true \
-  2>&1 | tee outputs/policy_200k_raw_stable_huangrm_pi05_true.log
+  --output_dir=./outputs/BBBpolicy_60k_raw_stable_huangrm_pi05_true \
+  --job_name=BBBpolicy_60k_raw_stable_huangrm_pi05_true \
+  --policy.repo_id=local/BBBpolicy_60k_raw_stable_huangrm_pi05_true \
+  2>&1 | tee outputs/BBBpolicy_60k_raw_stable_huangrm_pi05_true.log
+
+  
+#### train_raw_both
+
+source /inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/miniconda3/bin/activate
+conda activate mint
+cd /inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint
+
+mkdir -p outputs
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export TOKENIZERS_PARALLELISM=false
+
+# 你已验证单卡 conv 正常，这里保留库优先级避免多进程回退系统库
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+unset LD_PRELOAD
+
+accelerate launch \
+  --multi_gpu \
+  --num_processes=8 \
+  --mixed_precision=bf16 \
+  $(which lerobot-train) \
+  --dataset.repo_id=local/libero \
+  --dataset.root=/inspire/hdd/project/robot-decision/public/datasets/HuggingFaceVLA_cus/libero \
+  --policy.type=mint \
+  --policy.pretrained_path=huangrm/pi05_base \
+  --policy.vqvae_name_or_path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/AAAstageb_framework_align_both_resume_lr1e5_to300k/checkpoints/last/tokenizer.pt \
+  --policy.push_to_hub=false \
+  --policy.compile_model=false \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --policy.device=cuda \
+  --steps=60000 \
+  --batch_size=16 \
+  --log_freq=500 \
+  --save_freq=2000 \
+  --output_dir=./outputs/BBBpolicy_60k_raw_stable_huangrm_pi05_true_both \
+  --job_name=BBBpolicy_60k_raw_stable_huangrm_pi05_true_both \
+  --policy.repo_id=local/BBBpolicy_60k_raw_stable_huangrm_pi05_true_both \
+  2>&1 | tee outputs/BBBpolicy_60k_raw_stable_huangrm_pi05_true_both.log
  ```
 
  库自检
@@ -198,7 +240,7 @@ PY
 ## eval
 ```shell
 lerobot-eval \
-    --policy.path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/policy_200k_org_stable_huangrm_pi05/checkpoints/040000/pretrained_model \
+    --policy.path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/AAApolicy_60k_raw_stable_huangrm_pi05_true/checkpoints/040000/pretrained_model \
     --env.type=libero \
     --env.task=libero_10,libero_object,libero_spatial,libero_goal \
     --eval.batch_size=1 \
@@ -207,7 +249,7 @@ lerobot-eval \
     --policy.n_action_steps=4
 
 lerobot-eval \
-    --policy.path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/policy_200k_org_stable_try1/checkpoints/040000/pretrained_model \
+    --policy.path=/inspire/ssd/project/robot-decision/laijunxi-CZXS25230141/MINT/lerobot_policy_mint/outputs/AAApolicy_60k_raw_stable_huangrm_pi05_true_both/checkpoints/040000/pretrained_model \
     --env.type=libero \
     --env.task=libero_10,libero_object,libero_spatial,libero_goal \
     --eval.batch_size=1 \
